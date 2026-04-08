@@ -1,0 +1,257 @@
+pipeline {
+    agent any
+
+    environment {
+        // 项目配置
+        FRONTEND_DIR = 'chat-ioc-frontend'
+        BACKEND_DIR = 'chat-ioc-service'
+        DOCKER_REGISTRY = 'localhost:5000'  // 本地 registry 示例
+        IMAGE_TAG = "${BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    // 清理工作空间
+                    sh 'rm -rf *'
+                    
+                    // 克隆前端和后端项目
+                    git branch: 'main', url: 'https://github.com/qiaonan2026/chat-ioc-frontend.git'
+                    
+                    // 将前端代码移动到子目录
+                    sh '''
+                        mkdir -p temp_frontend
+                        rsync -av --exclude='temp_frontend' . temp_frontend/
+                        mkdir -p chat-ioc-frontend
+                        mv temp_frontend/* chat-ioc-frontend/
+                        rmdir temp_frontend
+                    '''
+                    
+                    // 克隆后端项目
+                    sh 'git clone https://github.com/qiaonan2026/chat-ioc-service.git temp_backend'
+                    sh 'mv temp_backend/* chat-ioc-service/ && rmdir temp_backend'
+                }
+            }
+        }
+
+        stage('Prepare Dockerfiles') {
+            steps {
+                script {
+                    // 复制之前创建的 Dockerfile 到项目中
+                    sh '''
+                        # 添加 Dockerfile 到前端项目
+                        cat > chat-ioc-frontend/Dockerfile << 'EOF'
+FROM node:18-alpine AS builder
+
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+
+COPY . .
+RUN npm run build
+
+# 生产环境使用 Nginx 服务
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/nginx.conf
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]
+EOF
+
+                        # 添加 Nginx 配置
+                        cat > chat-ioc-frontend/nginx.conf << 'EOF'
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    server {
+        listen       80;
+        server_name  localhost;
+
+        location / {
+            root   /usr/share/nginx/html;
+            index  index.html index.htm;
+            try_files $uri $uri/ /index.html;
+        }
+
+        location /api/ {
+            proxy_pass http://chat-ioc-service:8080/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        error_page   500 502 503 504  /50x.html;
+        location = /50x.html {
+            root   /usr/share/nginx/html;
+        }
+    }
+}
+EOF
+
+                        # 添加 Dockerfile 到后端项目
+                        cat > chat-ioc-service/Dockerfile << 'EOF'
+FROM maven:3.9.4-eclipse-temurin-17 AS builder
+
+WORKDIR /app
+COPY pom.xml .
+COPY src ./src
+
+RUN mvn clean package -DskipTests
+
+FROM eclipse-temurin:17-jre-alpine
+
+WORKDIR /app
+COPY --from=builder /app/target/chat-ioc-service-1.0.0-SNAPSHOT-shaded.jar app.jar
+
+EXPOSE 8080
+
+ENTRYPOINT ["java", "-jar", "app.jar"]
+EOF
+                    '''
+                }
+            }
+        }
+
+        stage('Build Frontend') {
+            steps {
+                dir('chat-ioc-frontend') {
+                    sh 'docker build -t ${DOCKER_REGISTRY}/chat-ioc-frontend:${IMAGE_TAG} .'
+                }
+            }
+        }
+
+        stage('Build Backend') {
+            steps {
+                dir('chat-ioc-service') {
+                    sh 'docker build -t ${DOCKER_REGISTRY}/chat-ioc-service:${IMAGE_TAG} .'
+                }
+            }
+        }
+
+        stage('Test Images') {
+            parallel {
+                stage('Test Frontend') {
+                    steps {
+                        sh '''
+                            docker run -d --name frontend-test -p 3001:80 ${DOCKER_REGISTRY}/chat-ioc-frontend:${IMAGE_TAG}
+                            sleep 10
+                            docker ps | grep frontend-test
+                            docker stop frontend-test
+                            docker rm frontend-test
+                        '''
+                    }
+                }
+                stage('Test Backend') {
+                    steps {
+                        sh '''
+                            docker run -d --name backend-test -p 8081:8080 ${DOCKER_REGISTRY}/chat-ioc-service:${IMAGE_TAG}
+                            sleep 15
+                            docker ps | grep backend-test
+                            docker stop backend-test
+                            docker rm backend-test
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Push Images') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                    docker tag ${DOCKER_REGISTRY}/chat-ioc-frontend:${IMAGE_TAG} ${DOCKER_REGISTRY}/chat-ioc-frontend:latest
+                    docker tag ${DOCKER_REGISTRY}/chat-ioc-service:${IMAGE_TAG} ${DOCKER_REGISTRY}/chat-ioc-service:latest
+                    
+                    # 推送到私有仓库 (示例)
+                    # docker push ${DOCKER_REGISTRY}/chat-ioc-frontend:${IMAGE_TAG}
+                    # docker push ${DOCKER_REGISTRY}/chat-ioc-service:${IMAGE_TAG}
+                    # docker push ${DOCKER_REGISTRY}/chat-ioc-frontend:latest
+                    # docker push ${DOCKER_REGISTRY}/chat-ioc-service:latest
+                '''
+            }
+        }
+
+        stage('Deploy to Dev') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                    # 创建部署目录
+                    mkdir -p deployment
+                    
+                    # 生成部署用的 docker-compose 文件
+                    cat > deployment/docker-compose-dev.yml << EOF
+version: '3.8'
+
+services:
+  chat-ioc-service:
+    image: ${DOCKER_REGISTRY}/chat-ioc-service:${IMAGE_TAG}
+    container_name: chat-ioc-backend-dev
+    ports:
+      - "8080:8080"
+    environment:
+      - JAVA_OPTS=-Xmx512m -Xms256m
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - chat-network
+
+  chat-ioc-frontend:
+    image: ${DOCKER_REGISTRY}/chat-ioc-frontend:${IMAGE_TAG}
+    container_name: chat-ioc-frontend-dev
+    ports:
+      - "8081:80"
+    depends_on:
+      chat-ioc-service:
+        condition: service_healthy
+    networks:
+      - chat-network
+
+networks:
+  chat-network:
+    driver: bridge
+EOF
+                    
+                    # 部署到开发环境 (示例)
+                    # cd deployment && docker-compose -f docker-compose-dev.yml up -d
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pipeline completed successfully!"
+            sh '''
+                echo "Frontend Image: ${DOCKER_REGISTRY}/chat-ioc-frontend:${IMAGE_TAG}"
+                echo "Backend Image: ${DOCKER_REGISTRY}/chat-ioc-service:${IMAGE_TAG}"
+            '''
+        }
+        failure {
+            echo "Pipeline failed!"
+        }
+        always {
+            // 清理临时容器
+            sh '''
+                docker ps -aq -f name=frontend-test | xargs -r docker rm -f
+                docker ps -aq -f name=backend-test | xargs -r docker rm -f
+            '''
+        }
+    }
+}
